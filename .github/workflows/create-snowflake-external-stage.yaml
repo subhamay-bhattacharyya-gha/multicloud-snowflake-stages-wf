@@ -1,0 +1,848 @@
+name: Create Snowflake External Stage
+
+on:
+  workflow_call:
+    inputs:
+      cloud-provider:
+        type: string
+        required: true
+        description: "aws | gcp | azure"
+
+      # Normalized storage inputs
+      storage-name:
+        type: string
+        required: true
+        description: "AWS/GCP bucket name OR Azure container name"
+      storage-prefix:
+        type: string
+        required: false
+        default: ""
+        description: "Optional prefix (no leading slash). Example: landing/"
+      encryption-key-ref:
+        type: string
+        required: true
+        description: "AWS KMS alias/name OR GCP KMS key id OR Azure Key Vault key id (provider-specific)."
+
+      # Snowflake objects
+      snowflake-account:
+        type: string
+        required: true
+        description: "Snowflake account identifier"
+      snowflake-user:
+        type: string
+        required: true
+        description: "Snowflake username"
+      snowflake-integration-name:
+        type: string
+        required: true
+      snowflake-stage-name:
+        type: string
+        required: true
+      snowflake-database:
+        type: string
+        required: true
+      snowflake-schema:
+        type: string
+        required: true
+      snowflake-role:
+        type: string
+        required: false
+        default: ACCOUNTADMIN
+      snowflake-warehouse:
+        type: string
+        required: false
+        default: ""
+
+      # Terraform directory
+      tf-dir:
+        type: string
+        required: true
+        description: "Path to the Terraform directory for the selected cloud provider"
+
+      # Terraform backend
+      backend-type:
+        type: string
+        required: false
+        default: "local"
+        description: "Terraform backend type (local, remote, s3, gcs, azurerm, etc.)"
+
+      # AWS S3 Backend Configuration
+      s3-bucket:
+        description: "Name of the S3 bucket used as the backend for storing the Terraform state file (AWS only)."
+        required: false
+        type: string
+      s3-region:
+        description: "AWS region where the S3 backend bucket is located (e.g., us-east-1, eu-west-1) (AWS only)."
+        required: false
+        type: string
+      s3-key-prefix:
+        description: "Optional prefix for the S3 state key (AWS only)."
+        required: false
+        type: string
+        default: ""
+      ci-pipeline:
+        type: boolean
+        required: false
+        default: false
+        description: "If true, includes commit SHA in state key for CI/CD isolation"
+
+      # Release tag for checkout
+      release-tag:
+        type: string
+        required: false
+        default: ""
+        description: "Git tag or branch to checkout. If empty, uses the current branch"
+
+      # Python version
+      python-version:
+        type: string
+        required: false
+        default: "3.12"
+        description: "Python version to use for Snowflake connector"
+
+      # AWS inputs
+      aws-region:
+        type: string
+        required: false
+        default: us-east-1
+
+      # GCP inputs
+      gcp-project-id:
+        type: string
+        required: false
+        default: ""
+      gcp-location:
+        type: string
+        required: false
+        default: US
+
+    secrets:
+      # Cloud auth
+      aws-role-to-assume:
+        required: false
+      gcp-wif-provider:
+        required: false
+      gcp-service-account:
+        required: false
+      azure-client-id:
+        required: false
+      azure-tenant-id:
+        required: false
+      azure-subscription-id:
+        required: false
+
+      # Terraform backend
+      tfc-token:
+        required: false
+        description: "Terraform Cloud/Enterprise API token"
+
+      # Snowflake key-pair auth
+      snowflake-private-key-pem:
+        required: true
+      snowflake-private-key-passphrase:
+        required: true
+
+jobs:
+  # ---------------------------
+  # Validate inputs and display configuration
+  # ---------------------------
+  validate-and-display-inputs:
+    name: Validate Inputs & Display Configuration
+    runs-on: ubuntu-latest
+    outputs:
+      checkout-ref: ${{ steps.set-ref.outputs.ref }}
+    steps:
+      - name: Set Checkout Ref
+        id: set-ref
+        shell: bash
+        run: |
+          if [[ -n "${{ inputs.release-tag }}" ]]; then
+            echo "ref=${{ inputs.release-tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "ref=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Validate cloud provider
+        run: |
+          CLOUD_PROVIDER="${{ inputs.cloud-provider }}"
+          if [[ ! "$CLOUD_PROVIDER" =~ ^(aws|gcp|azure)$ ]]; then
+            echo "❌ Error: cloud-provider must be one of: aws, gcp, azure"
+            echo "   Provided value: $CLOUD_PROVIDER"
+            exit 1
+          fi
+          echo "✅ Cloud provider validation passed: $CLOUD_PROVIDER"
+
+      - name: Display configuration
+        run: |
+          echo "## Workflow Configuration" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          echo "### General Inputs" >> $GITHUB_STEP_SUMMARY
+          echo "| Input | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| cloud-provider | \`${{ inputs.cloud-provider }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| storage-name | \`${{ inputs.storage-name }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| storage-prefix | \`${{ inputs.storage-prefix || '(empty)' }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| encryption-key-ref | \`${{ inputs.encryption-key-ref }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| tf-dir | \`${{ inputs.tf-dir }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| backend-type | \`${{ inputs.backend-type }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          echo "### Snowflake Configuration" >> $GITHUB_STEP_SUMMARY
+          echo "| Input | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| snowflake-integration-name | \`${{ inputs.snowflake-integration-name }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| snowflake-stage-name | \`${{ inputs.snowflake-stage-name }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| snowflake-database | \`${{ inputs.snowflake-database }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| snowflake-schema | \`${{ inputs.snowflake-schema }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| snowflake-role | \`${{ inputs.snowflake-role }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| snowflake-warehouse | \`${{ inputs.snowflake-warehouse || '(empty)' }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          echo "### AWS Configuration" >> $GITHUB_STEP_SUMMARY
+          echo "| Input | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| aws-region | \`${{ inputs.aws-region }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          echo "### GCP Configuration" >> $GITHUB_STEP_SUMMARY
+          echo "| Input | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| gcp-project-id | \`${{ inputs.gcp-project-id || '(empty)' }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| gcp-location | \`${{ inputs.gcp-location }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+      - name: Display secrets status
+        env:
+          AWS_ROLE: ${{ secrets.aws-role-to-assume }}
+          GCP_WIF: ${{ secrets.gcp-wif-provider }}
+          GCP_SA: ${{ secrets.gcp-service-account }}
+          AZURE_CLIENT: ${{ secrets.azure-client-id }}
+          AZURE_TENANT: ${{ secrets.azure-tenant-id }}
+          AZURE_SUB: ${{ secrets.azure-subscription-id }}
+          TFC_TOKEN: ${{ secrets.tfc-token }}
+          SF_KEY: ${{ secrets.snowflake-private-key-pem }}
+          SF_PASS: ${{ secrets.snowflake-private-key-passphrase }}
+        run: |
+          echo "### Secrets Status" >> $GITHUB_STEP_SUMMARY
+          echo "| Secret | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|--------|" >> $GITHUB_STEP_SUMMARY
+          
+          # Cloud auth secrets
+          if [ -n "$AWS_ROLE" ]; then
+            echo "| aws-role-to-assume | ✅ Provided |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| aws-role-to-assume | ⚠️ Not provided |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          if [ -n "$GCP_WIF" ]; then
+            echo "| gcp-wif-provider | ✅ Provided |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| gcp-wif-provider | ⚠️ Not provided |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          if [ -n "$GCP_SA" ]; then
+            echo "| gcp-service-account | ✅ Provided |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| gcp-service-account | ⚠️ Not provided |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          if [ -n "$AZURE_CLIENT" ]; then
+            echo "| azure-client-id | ✅ Provided |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| azure-client-id | ⚠️ Not provided |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          if [ -n "$AZURE_TENANT" ]; then
+            echo "| azure-tenant-id | ✅ Provided |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| azure-tenant-id | ⚠️ Not provided |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          if [ -n "$AZURE_SUB" ]; then
+            echo "| azure-subscription-id | ✅ Provided |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| azure-subscription-id | ⚠️ Not provided |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # Terraform backend
+          if [ -n "$TFC_TOKEN" ]; then
+            echo "| tfc-token | ✅ Provided |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| tfc-token | ⚠️ Not provided |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # Snowflake secrets
+          if [ -n "$SF_KEY" ]; then
+            echo "| snowflake-private-key-pem | ✅ Provided |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| snowflake-private-key-pem | ❌ Not provided (REQUIRED) |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          if [ -n "$SF_PASS" ]; then
+            echo "| snowflake-private-key-passphrase | ✅ Provided |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| snowflake-private-key-passphrase | ❌ Not provided (REQUIRED) |" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  # ---------------------------
+  # AWS STEP 1 (Terraform)
+  # ---------------------------
+  provision-aws-infrastructure:
+    name: Provision AWS Infrastructure
+    if: ${{ inputs.cloud-provider == 'aws' }}
+    runs-on: ubuntu-latest
+    needs: [validate-and-display-inputs]
+    permissions: { id-token: write, contents: read }
+    outputs:
+      role_arn: ${{ steps.out.outputs.role_arn }}
+      storage_url: ${{ steps.out.outputs.storage_url }}
+    steps:
+      - name: Checkout Repo
+        id: checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.validate-and-display-inputs.outputs.checkout-ref }}
+
+      - name: Configure AWS Authentication
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ inputs.aws-region }}
+          role-to-assume: ${{ secrets.aws-role-to-assume }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      #  Terraform Cloud Backend #############################################
+      - name: Setup Terraform Cloud Credentials
+        id: setup-tfc-credentials
+        if: inputs.backend-type == 'remote'
+        shell: bash
+        run: |
+          mkdir -p ~/.terraform.d
+          cat > ~/.terraform.d/credentials.tfrc.json << EOF
+          {
+            "credentials": {
+              "app.terraform.io": {
+                "token": "${{ secrets.tfc-token }}"
+              }
+            }
+          }
+          EOF
+
+      - name: Initialize Terraform with HCP Terraform Cloud Backend
+        id: terraform-init-remote
+        if: inputs.backend-type == 'remote'
+        shell: bash
+        working-directory: ${{ inputs.tf-dir }}
+        run: |
+          terraform init -input=false
+
+      #  AWS S3 Backend #############################################
+      - name: Generate Terraform State Key
+        id: generate-tfstate-key
+        if: inputs.backend-type == 's3'
+        shell: bash
+        run: |
+          if [[ "${{ inputs.ci-pipeline }}" == "true" ]]; then
+            state_key="${{ github.repository }}/${{ github.sha }}/terraform.tfstate"
+          else
+            state_key="${{ github.repository }}/terraform.tfstate"
+          fi
+          echo "state_key=$state_key" >> $GITHUB_OUTPUT
+
+      - name: Initialize Terraform with S3 Backend
+        id: terraform-init-s3
+        if: inputs.backend-type == 's3'
+        shell: bash
+        working-directory: ${{ inputs.tf-dir }}
+        run: |
+          # Build state key with optional prefix
+          if [[ -n "${{ inputs.s3-key-prefix }}" ]]; then
+            full_key="${{ inputs.s3-key-prefix }}/${{ steps.generate-tfstate-key.outputs.state_key }}"
+          else
+            full_key="${{ steps.generate-tfstate-key.outputs.state_key }}"
+          fi
+          
+          # Initialize with S3 backend
+          terraform init -input=false \
+            -backend-config="bucket=${{ inputs.s3-bucket }}" \
+            -backend-config="key=$full_key" \
+            -backend-config="region=${{ inputs.s3-region }}" \
+            -backend-config="encrypt=true" \
+            -backend-config="use_lockfile=true"
+
+      - name: Terraform apply (baseline)
+        working-directory: ${{ inputs.tf-dir }}
+        run: |
+          terraform apply -auto-approve \
+            -var="aws_region=${{ inputs.aws-region }}" \
+            -var="storage_name=${{ inputs.storage-name }}" \
+            -var="storage_prefix=${{ inputs.storage-prefix }}" \
+            -var="encryption_key_ref=${{ inputs.encryption-key-ref }}"
+
+      - name: Outputs
+        id: out
+        working-directory: ${{ inputs.tf-dir }}
+        run: |
+          echo "role_arn=$(terraform output -raw snowflake_access_role_arn)" >> "$GITHUB_OUTPUT"
+          echo "storage_url=$(terraform output -raw storage_url)" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------
+  # GCP STEP 1 (Terraform)
+  # ---------------------------
+  # TODO: Implement after AWS testing
+  # provision-gcp-infrastructure:
+  #   if: ${{ inputs.cloud-provider == 'gcp' }}
+  #   runs-on: ubuntu-latest
+  #   needs: [validate-and-display-inputs]
+  #   permissions: { id-token: write, contents: read }
+  #   outputs:
+  #     storage_url: ${{ steps.out.outputs.storage_url }}
+  #   steps:
+  #     - name: Checkout Repo
+  #       id: checkout
+  #       uses: actions/checkout@v6
+  #       with:
+  #         ref: ${{ needs.validate-and-display-inputs.outputs.checkout-ref }}
+  #     - uses: google-github-actions/auth@v2
+  #       with:
+  #         workload_identity_provider: ${{ secrets.gcp-wif-provider }}
+  #         service_account: ${{ secrets.gcp-service-account }}
+  #     - name: Setup Terraform
+  #       uses: hashicorp/setup-terraform@v3
+  #
+  #     #  Terraform Cloud Backend #############################################
+  #     - name: Setup Terraform Cloud Credentials
+  #       id: setup-tfc-credentials
+  #       if: inputs.backend-type == 'remote'
+  #       shell: bash
+  #       run: |
+  #         mkdir -p ~/.terraform.d
+  #         cat > ~/.terraform.d/credentials.tfrc.json << EOF
+  #         {
+  #           "credentials": {
+  #             "app.terraform.io": {
+  #               "token": "${{ secrets.tfc-token }}"
+  #             }
+  #           }
+  #         }
+  #         EOF
+  #
+  #     - name: Initialize Terraform with HCP Terraform Cloud Backend
+  #       id: terraform-init-remote
+  #       if: inputs.backend-type == 'remote'
+  #       shell: bash
+  #       working-directory: ${{ inputs.tf-dir }}
+  #       run: |
+  #         terraform init -input=false
+  #
+  #     #  GCS Backend #############################################
+  #     - name: Generate Terraform State Key
+  #       id: generate-tfstate-key
+  #       if: inputs.backend-type == 'gcs'
+  #       shell: bash
+  #       run: |
+  #         if [[ "${{ inputs.ci-pipeline }}" == "true" ]]; then
+  #           state_key="${{ github.repository }}/${{ github.sha }}/terraform.tfstate"
+  #         else
+  #           state_key="${{ github.repository }}/terraform.tfstate"
+  #         fi
+  #         echo "state_key=$state_key" >> $GITHUB_OUTPUT
+  #
+  #     - name: Initialize Terraform with GCS Backend
+  #       id: terraform-init-gcs
+  #       if: inputs.backend-type == 'gcs'
+  #       shell: bash
+  #       working-directory: ${{ inputs.tf-dir }}
+  #       run: |
+  #         # Build state key with optional prefix
+  #         if [[ -n "${{ inputs.gcs-prefix }}" ]]; then
+  #           full_key="${{ inputs.gcs-prefix }}/${{ steps.generate-tfstate-key.outputs.state_key }}"
+  #         else
+  #           full_key="${{ steps.generate-tfstate-key.outputs.state_key }}"
+  #         fi
+  #         
+  #         # Initialize with GCS backend
+  #         terraform init -input=false \
+  #           -backend-config="bucket=${{ inputs.gcs-bucket }}" \
+  #           -backend-config="prefix=$full_key"
+  #
+  #     - name: Terraform apply (baseline)
+  #       working-directory: ${{ inputs.tf-dir }}
+  #       run: |
+  #         terraform apply -auto-approve \
+  #           -var="project_id=${{ inputs.gcp-project-id }}" \
+  #           -var="location=${{ inputs.gcp-location }}" \
+  #           -var="storage_name=${{ inputs.storage-name }}" \
+  #           -var="storage_prefix=${{ inputs.storage-prefix }}" \
+  #           -var="encryption_key_ref=${{ inputs.encryption-key-ref }}"
+  #     - name: Outputs
+  #       id: out
+  #       working-directory: ${{ inputs.tf-dir }}
+  #       run: |
+  #         echo "storage_url=$(terraform output -raw storage_url)" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------
+  # AZURE STEP 1 (Terraform)
+  # ---------------------------
+  # TODO: Implement after AWS testing
+  # provision-azure-infrastructure:
+  #   if: ${{ inputs.cloud-provider == 'azure' }}
+  #   runs-on: ubuntu-latest
+  #   needs: [validate-and-display-inputs]
+  #   permissions: { id-token: write, contents: read }
+  #   outputs:
+  #     storage_url: ${{ steps.out.outputs.storage_url }}
+  #   steps:
+  #     - name: Checkout Repo
+  #       id: checkout
+  #       uses: actions/checkout@v6
+  #       with:
+  #         ref: ${{ needs.validate-and-display-inputs.outputs.checkout-ref }}
+  #     - uses: azure/login@v2
+  #       with:
+  #         client-id: ${{ secrets.azure-client-id }}
+  #         tenant-id: ${{ secrets.azure-tenant-id }}
+  #         subscription-id: ${{ secrets.azure-subscription-id }}
+  #     - name: Setup Terraform
+  #       uses: hashicorp/setup-terraform@v3
+  #
+  #     #  Terraform Cloud Backend #############################################
+  #     - name: Setup Terraform Cloud Credentials
+  #       id: setup-tfc-credentials
+  #       if: inputs.backend-type == 'remote'
+  #       shell: bash
+  #       run: |
+  #         mkdir -p ~/.terraform.d
+  #         cat > ~/.terraform.d/credentials.tfrc.json << EOF
+  #         {
+  #           "credentials": {
+  #             "app.terraform.io": {
+  #               "token": "${{ secrets.tfc-token }}"
+  #             }
+  #           }
+  #         }
+  #         EOF
+  #
+  #     - name: Initialize Terraform with HCP Terraform Cloud Backend
+  #       id: terraform-init-remote
+  #       if: inputs.backend-type == 'remote'
+  #       shell: bash
+  #       working-directory: ${{ inputs.tf-dir }}
+  #       run: |
+  #         terraform init -input=false
+  #
+  #     #  Azure Storage Backend #############################################
+  #     - name: Generate Terraform State Key
+  #       id: generate-tfstate-key
+  #       if: inputs.backend-type == 'azurerm'
+  #       shell: bash
+  #       run: |
+  #         if [[ "${{ inputs.ci-pipeline }}" == "true" ]]; then
+  #           state_key="${{ github.repository }}/${{ github.sha }}/terraform.tfstate"
+  #         else
+  #           state_key="${{ github.repository }}/terraform.tfstate"
+  #         fi
+  #         echo "state_key=$state_key" >> $GITHUB_OUTPUT
+  #
+  #     - name: Initialize Terraform with Azure Storage Backend
+  #       id: terraform-init-azurerm
+  #       if: inputs.backend-type == 'azurerm'
+  #       shell: bash
+  #       working-directory: ${{ inputs.tf-dir }}
+  #       run: |
+  #         # Build state key with optional prefix
+  #         if [[ -n "${{ inputs.azure-state-key-prefix }}" ]]; then
+  #           full_key="${{ inputs.azure-state-key-prefix }}/${{ steps.generate-tfstate-key.outputs.state_key }}"
+  #         else
+  #           full_key="${{ steps.generate-tfstate-key.outputs.state_key }}"
+  #         fi
+  #         
+  #         # Initialize with Azure Storage backend
+  #         terraform init -input=false \
+  #           -backend-config="resource_group_name=${{ inputs.azure-backend-resource-group }}" \
+  #           -backend-config="storage_account_name=${{ inputs.azure-backend-storage-account }}" \
+  #           -backend-config="container_name=${{ inputs.azure-backend-container }}" \
+  #           -backend-config="key=$full_key"
+  #
+  #     - name: Terraform apply (baseline)
+  #       working-directory: ${{ inputs.tf-dir }}
+  #       run: |
+  #         terraform apply -auto-approve \
+  #           -var="storage_name=${{ inputs.storage-name }}" \
+  #           -var="storage_prefix=${{ inputs.storage-prefix }}" \
+  #           -var="encryption_key_ref=${{ inputs.encryption-key-ref }}"
+  #     - name: Outputs
+  #       id: out
+  #       working-directory: ${{ inputs.tf-dir }}
+  #       run: |
+  #         echo "storage_url=$(terraform output -raw storage_url)" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------
+  # Snowflake step (all clouds)
+  # ---------------------------
+  create-snowflake-integration:
+    name: Create Snowflake Integration & Stage
+    runs-on: ubuntu-latest
+    needs: [validate-and-display-inputs, provision-aws-infrastructure] # TODO: Add provision-gcp-infrastructure, provision-azure-infrastructure after testing
+    outputs:
+      # AWS
+      snowflake_principal_arn: ${{ steps.sf.outputs.snowflake_principal_arn }}
+      snowflake_external_id: ${{ steps.sf.outputs.snowflake_external_id }}
+      # GCP
+      snowflake_gcs_service_account: ${{ steps.sf.outputs.snowflake_gcs_service_account }}
+      # Azure
+      azure_consent_url: ${{ steps.sf.outputs.azure_consent_url }}
+      azure_app_name: ${{ steps.sf.outputs.azure_app_name }}
+    steps:
+      - name: Checkout Repo
+        id: checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.validate-and-display-inputs.outputs.checkout-ref }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - name: Install Snowflake connector
+        run: |
+          python -m pip install --upgrade pip
+          pip install snowflake-connector-python cryptography
+
+      - name: Create integration + stage
+        id: sf
+        env:
+          CLOUD_PROVIDER: ${{ inputs.cloud-provider }}
+          # Snowflake auth
+          SNOWFLAKE_ACCOUNT: ${{ inputs.snowflake-account }}
+          SNOWFLAKE_USER: ${{ inputs.snowflake-user }}
+          SNOWFLAKE_PRIVATE_KEY_PEM: ${{ secrets.snowflake-private-key-pem }}
+          SNOWFLAKE_PRIVATE_KEY_PASSPHRASE: ${{ secrets.snowflake-private-key-passphrase }}
+          SNOWFLAKE_ROLE: ${{ inputs.snowflake-role }}
+          SNOWFLAKE_WAREHOUSE: ${{ inputs.snowflake-warehouse }}
+          # Objects
+          INTEGRATION: ${{ inputs.snowflake-integration-name }}
+          STAGE: ${{ inputs.snowflake-stage-name }}
+          DB: ${{ inputs.snowflake-database }}
+          SCHEMA: ${{ inputs.snowflake-schema }}
+          # Provider values
+          AWS_ROLE_ARN: ${{ needs.provision-aws-infrastructure.outputs.role_arn }}
+          STORAGE_URL_AWS: ${{ needs.provision-aws-infrastructure.outputs.storage_url }}
+          # TODO: Uncomment after GCP/Azure testing
+          # STORAGE_URL_GCP: ${{ needs.provision-gcp-infrastructure.outputs.storage_url }}
+          # STORAGE_URL_AZURE: ${{ needs.provision-azure-infrastructure.outputs.storage_url }}
+          AZURE_TENANT_ID: ${{ secrets.azure-tenant-id }}
+        run: |
+          python .github/scripts/snowflake_create_integration_stage.py
+
+  # ---------------------------
+  # AWS STEP 2 (Terraform trust finalize)
+  # ---------------------------
+  finalize-aws-trust-policy:
+    if: ${{ inputs.cloud-provider == 'aws' }}
+    runs-on: ubuntu-latest
+    needs: [validate-and-display-inputs, provision-aws-infrastructure, create-snowflake-integration]
+    permissions: { id-token: write, contents: read }
+    steps:
+      - name: Checkout Repo
+        id: checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.validate-and-display-inputs.outputs.checkout-ref }}
+
+      - name: Configure AWS Authentication
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ inputs.aws-region }}
+          role-to-assume: ${{ secrets.aws-role-to-assume }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      #  Terraform Cloud Backend #############################################
+      - name: Setup Terraform Cloud Credentials
+        id: setup-tfc-credentials
+        if: inputs.backend-type == 'remote'
+        shell: bash
+        run: |
+          mkdir -p ~/.terraform.d
+          cat > ~/.terraform.d/credentials.tfrc.json << EOF
+          {
+            "credentials": {
+              "app.terraform.io": {
+                "token": "${{ secrets.tfc-token }}"
+              }
+            }
+          }
+          EOF
+
+      - name: Initialize Terraform with HCP Terraform Cloud Backend
+        id: terraform-init-remote
+        if: inputs.backend-type == 'remote'
+        shell: bash
+        working-directory: ${{ inputs.tf-dir }}
+        run: |
+          terraform init -input=false
+
+      #  AWS S3 Backend #############################################
+      - name: Generate Terraform State Key
+        id: generate-tfstate-key
+        if: inputs.backend-type == 's3'
+        shell: bash
+        run: |
+          if [[ "${{ inputs.ci-pipeline }}" == "true" ]]; then
+            state_key="${{ github.repository }}/${{ github.sha }}/terraform.tfstate"
+          else
+            state_key="${{ github.repository }}/terraform.tfstate"
+          fi
+          echo "state_key=$state_key" >> $GITHUB_OUTPUT
+
+      - name: Initialize Terraform with S3 Backend
+        id: terraform-init-s3
+        if: inputs.backend-type == 's3'
+        shell: bash
+        working-directory: ${{ inputs.tf-dir }}
+        run: |
+          # Build state key with optional prefix
+          if [[ -n "${{ inputs.s3-key-prefix }}" ]]; then
+            full_key="${{ inputs.s3-key-prefix }}/${{ steps.generate-tfstate-key.outputs.state_key }}"
+          else
+            full_key="${{ steps.generate-tfstate-key.outputs.state_key }}"
+          fi
+          
+          # Initialize with S3 backend
+          terraform init -input=false \
+            -backend-config="bucket=${{ inputs.s3-bucket }}" \
+            -backend-config="key=$full_key" \
+            -backend-config="region=${{ inputs.s3-region }}" \
+            -backend-config="encrypt=true" \
+            -backend-config="use_lockfile=true"
+
+      - name: Terraform apply (finalize trust)
+        working-directory: ${{ inputs.tf-dir }}
+        run: |
+          terraform apply -auto-approve \
+            -var="aws_region=${{ inputs.aws-region }}" \
+            -var="storage_name=${{ inputs.storage-name }}" \
+            -var="storage_prefix=${{ inputs.storage-prefix }}" \
+            -var="encryption_key_ref=${{ inputs.encryption-key-ref }}" \
+            -var="snowflake_principal_arn=${{ needs.create-snowflake-integration.outputs.snowflake_principal_arn }}" \
+            -var="snowflake_external_id=${{ needs.create-snowflake-integration.outputs.snowflake_external_id }}"
+
+  # ---------------------------
+  # GCP STEP 2 (Grant bucket/KMS to Snowflake SA)
+  # ---------------------------
+  # TODO: Implement after AWS testing
+  # grant-gcp-permissions:
+  #   if: ${{ inputs.cloud-provider == 'gcp' }}
+  #   runs-on: ubuntu-latest
+  #   needs: [validate-and-display-inputs, provision-gcp-infrastructure, create-snowflake-integration]
+  #   permissions: { id-token: write, contents: read }
+  #   steps:
+  #     - name: Checkout Repo
+  #       id: checkout
+  #       uses: actions/checkout@v6
+  #       with:
+  #         ref: ${{ needs.validate-and-display-inputs.outputs.checkout-ref }}
+  #     - uses: google-github-actions/auth@v2
+  #       with:
+  #         workload_identity_provider: ${{ secrets.gcp-wif-provider }}
+  #         service_account: ${{ secrets.gcp-service-account }}
+  #     - name: Setup Terraform
+  #       uses: hashicorp/setup-terraform@v3
+  #
+  #     #  Terraform Cloud Backend #############################################
+  #     - name: Setup Terraform Cloud Credentials
+  #       id: setup-tfc-credentials
+  #       if: inputs.backend-type == 'remote'
+  #       shell: bash
+  #       run: |
+  #         mkdir -p ~/.terraform.d
+  #         cat > ~/.terraform.d/credentials.tfrc.json << EOF
+  #         {
+  #           "credentials": {
+  #             "app.terraform.io": {
+  #               "token": "${{ secrets.tfc-token }}"
+  #             }
+  #           }
+  #         }
+  #         EOF
+  #
+  #     - name: Initialize Terraform with HCP Terraform Cloud Backend
+  #       id: terraform-init-remote
+  #       if: inputs.backend-type == 'remote'
+  #       shell: bash
+  #       working-directory: ${{ inputs.tf-dir }}
+  #       run: |
+  #         terraform init -input=false
+  #
+  #     #  GCS Backend #############################################
+  #     - name: Generate Terraform State Key
+  #       id: generate-tfstate-key
+  #       if: inputs.backend-type == 'gcs'
+  #       shell: bash
+  #       run: |
+  #         if [[ "${{ inputs.ci-pipeline }}" == "true" ]]; then
+  #           state_key="${{ github.repository }}/${{ github.sha }}/terraform.tfstate"
+  #         else
+  #           state_key="${{ github.repository }}/terraform.tfstate"
+  #         fi
+  #         echo "state_key=$state_key" >> $GITHUB_OUTPUT
+  #
+  #     - name: Initialize Terraform with GCS Backend
+  #       id: terraform-init-gcs
+  #       if: inputs.backend-type == 'gcs'
+  #       shell: bash
+  #       working-directory: ${{ inputs.tf-dir }}
+  #       run: |
+  #         # Build state key with optional prefix
+  #         if [[ -n "${{ inputs.gcs-prefix }}" ]]; then
+  #           full_key="${{ inputs.gcs-prefix }}/${{ steps.generate-tfstate-key.outputs.state_key }}"
+  #         else
+  #           full_key="${{ steps.generate-tfstate-key.outputs.state_key }}"
+  #         fi
+  #         
+  #         # Initialize with GCS backend
+  #         terraform init -input=false \
+  #           -backend-config="bucket=${{ inputs.gcs-bucket }}" \
+  #           -backend-config="prefix=$full_key"
+  #
+  #     - name: Terraform apply (grant Snowflake SA)
+  #       working-directory: ${{ inputs.tf-dir }}
+  #       run: |
+  #         terraform apply -auto-approve \
+  #           -var="project_id=${{ inputs.gcp-project-id }}" \
+  #           -var="location=${{ inputs.gcp-location }}" \
+  #           -var="storage_name=${{ inputs.storage-name }}" \
+  #           -var="storage_prefix=${{ inputs.storage-prefix }}" \
+  #           -var="encryption_key_ref=${{ inputs.encryption-key-ref }}" \
+  #           -var="snowflake_gcs_service_account=${{ needs.create-snowflake-integration.outputs.snowflake_gcs_service_account }}"
+
+  # ---------------------------
+  # Azure STEP 2 (Print consent + optional RBAC)
+  # ---------------------------
+  # TODO: Implement after AWS testing
+  # configure-azure-consent:
+  #   if: ${{ inputs.cloud-provider == 'azure' }}
+  #   runs-on: ubuntu-latest
+  #   needs: [validate-and-display-inputs, provision-azure-infrastructure, create-snowflake-integration]
+  #   permissions: { id-token: write, contents: read }
+  #   steps:
+  #     - name: Checkout Repo
+  #       id: checkout
+  #       uses: actions/checkout@v6
+  #       with:
+  #         ref: ${{ needs.validate-and-display-inputs.outputs.checkout-ref }}
+  #     - uses: azure/login@v2
+  #       with:
+  #         client-id: ${{ secrets.azure-client-id }}
+  #         tenant-id: ${{ secrets.azure-tenant-id }}
+  #         subscription-id: ${{ secrets.azure-subscription-id }}
+  #     - name: Print consent URL (required once per tenant)
+  #       run: |
+  #         echo "AZURE_CONSENT_URL: ${{ needs.create-snowflake-integration.outputs.azure_consent_url }}"
+  #         echo "AZURE_MULTI_TENANT_APP_NAME: ${{ needs.create-snowflake-integration.outputs.azure_app_name }}"
+  #         echo ""
+  #         echo "If consent was not done yet, open AZURE_CONSENT_URL in a browser as an Azure admin and click Accept."
